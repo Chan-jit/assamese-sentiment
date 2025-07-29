@@ -1,0 +1,119 @@
+import numpy as np
+import pandas as pd
+import re
+
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import confusion_matrix, classification_report, f1_score
+
+from tensorflow.keras.preprocessing.text import Tokenizer
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense, Embedding, LSTM, SpatialDropout1D, Bidirectional, Dropout
+from tensorflow.keras.callbacks import EarlyStopping
+from tensorflow.keras.utils import to_categorical
+
+import matplotlib.pyplot as plt
+
+# Read CSV
+data = pd.read_csv('/content/Assamese Sentiments file.csv')
+data = data[['Assamese Text', 'Sentiments']] # Use correct column names
+data.rename(columns={'Assamese Text': 'text', 'Sentiments': 'sentiment'}, inplace=True) # Rename columns for consistency
+data['text'] = data['text'].astype(str)
+data['text'] = data['text'].apply(lambda x: re.sub(r'[^\u0980-\u09FF\s]', '', x))
+data['text'] = data['text'].apply(lambda x: x.replace('rt', ''))
+data = data[~data['text'].isnull()]
+data = data[data['text'].str.strip() != ""]
+
+label_to_id = {'Negative': 0, 'Neutral': 1, 'Positive': 2}
+data['sentiment_label'] = data['sentiment'].map(label_to_id)
+id_to_label = {v: k for k, v in label_to_id.items()}
+data = data.reset_index(drop=True)
+print("Label distribution:")
+print(data['sentiment'].value_counts())
+
+# ========== IMPROVEMENT 1: Class Weight Calculation ==========
+from sklearn.utils.class_weight import compute_class_weight
+class_weights = compute_class_weight(class_weight='balanced', classes=np.unique(data['sentiment_label']), y=data['sentiment_label'])
+class_weight_dict = dict(enumerate(class_weights))
+print("Class weights:", class_weight_dict)
+
+# Train / Test Split (stratified)
+X_train, X_test, y_train, y_test = train_test_split(
+    data['text'],
+    data['sentiment_label'],
+    test_size=0.15,
+    random_state=42,
+    stratify=data['sentiment_label']
+)
+
+# ========== IMPROVEMENT 2: Text Augmentation (Optional) ==========
+# You may apply text augmentation techniques here, such as synonym replacement or back-translation, to the training data if available.
+
+# Tokenizer
+max_features = 15000  # Reduced for regularization
+tokenizer = Tokenizer(num_words=max_features, oov_token="<OOV>")
+tokenizer.fit_on_texts(X_train.values)
+
+X_train_seq = tokenizer.texts_to_sequences(X_train.values)
+X_test_seq = tokenizer.texts_to_sequences(X_test.values)
+
+maxlen = 60  # Limiting to the 60 longest tokens
+X_train_pad = pad_sequences(X_train_seq, maxlen=maxlen, padding='post')
+X_test_pad = pad_sequences(X_test_seq, maxlen=maxlen, padding='post')
+
+y_train_cat = to_categorical(y_train, num_classes=3)
+y_test_cat = to_categorical(y_test, num_classes=3)
+
+# ========== IMPROVEMENT 3: Bidirectional LSTM & Dropout Layer ==========
+embed_dim = 128  # Lowered for regularization
+lstm_out = 128
+model = Sequential()
+model.add(Embedding(max_features, embed_dim, input_length=maxlen))
+model.add(SpatialDropout1D(0.5))
+model.add(Bidirectional(LSTM(lstm_out, dropout=0.35, recurrent_dropout=0.2, return_sequences=False)))
+model.add(Dropout(0.4))
+model.add(Dense(64, activation='relu'))
+model.add(Dense(3, activation='softmax'))
+model.compile(loss='categorical_crossentropy', optimizer='adam', metrics=['accuracy'])
+print(model.summary())
+
+# ========== IMPROVEMENT 4: Early Stopping & Class Weights ==========
+batch_size = 64
+history = model.fit(
+    X_train_pad, y_train_cat,
+    epochs=18,
+    batch_size=batch_size,
+    validation_data=(X_test_pad, y_test_cat),
+    callbacks=[EarlyStopping(monitor='val_loss', patience=4, min_delta=0.0005, restore_best_weights=True)],
+    class_weight=class_weight_dict
+)
+
+plt.plot(history.history['accuracy'], label='Training acc')
+plt.plot(history.history['val_accuracy'], label='Validation acc')
+plt.title('Training and validation accuracy')
+plt.legend()
+plt.show()
+
+plt.plot(history.history['loss'], label='Training loss')
+plt.plot(history.history['val_loss'], label='Validation loss')
+plt.title('Training and validation loss')
+plt.legend()
+plt.show()
+# ========== IMPROVEMENT 5: Threshold Tuning ==========
+# Use class probabilities for manual threshold tuning if classes are imbalanced (not shown here; the softmax is usually best for multiclass but you CAN optimize one-vs-all thresholds)
+
+# Predictions
+y_pred_probs = model.predict(X_test_pad)
+y_pred = np.argmax(y_pred_probs, axis=-1)
+y_true = np.argmax(y_test_cat, axis=-1)
+
+print("Confusion Matrix:")
+print(confusion_matrix(y_true, y_pred))
+print("\nClassification Report:")
+print(classification_report(y_true, y_pred, target_names=[id_to_label[i] for i in range(3)]))
+f1 = f1_score(y_true, y_pred, average='macro')
+print(f"\nMacro F1-score: {f1:.4f}")
+f1_micro = f1_score(y_true, y_pred, average='micro')
+f1_weighted = f1_score(y_true, y_pred, average='weighted')
+print(f"Micro F1-score: {f1_micro:.4f}")
+print(f"Weighted F1-score: {f1_weighted:.4f}")
